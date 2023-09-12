@@ -132,3 +132,6 @@ dmypy.json
 .idea/
 **/static/
 **/media/
+/config/config.py
+/sync_main.py
+/iss_sync_client.py

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime
 from decimal import Decimal
@@ -5,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from config.config import PASSWORD, USER, FILTER_CRITERIA
 from iss_client import Config
 from iss_client import MicexAuth
 from iss_client import MicexISSClient
@@ -12,27 +14,6 @@ from iss_client import MicexISSDataHandler
 from logger import create_logger
 
 logger = logging.getLogger('basic')
-
-
-class MyConfig(Config):
-
-    def __init__(self, price_max: float = 101, duration_max: int = 365, trades_min: int = 1000):
-        super().__init__()
-        self._price_max: float = price_max
-        self._duration_max: int = duration_max
-        self._trades_min: int = trades_min
-
-    def price_max(self) -> float:
-        return self._price_max
-
-    def duration_max(self) -> int:
-        return self._duration_max
-
-    def trades_min(self) -> int:
-        return self._trades_min
-
-    def filter_criteries(self) -> dict:
-        return {'price_max': self._price_max, 'duration_max': self._duration_max, 'trades_min': self._trades_min}
 
 
 class MyData(object):
@@ -60,13 +41,6 @@ class MyData(object):
 class MyDataHandler(MicexISSDataHandler):
     """ This handler will be receiving pieces of data from the ISS client. """
 
-    FILTER_CRITERIES = {
-        'price_max': 101.0,
-        'duration_max': 365,
-        'trades_min': 300,
-        'faceunits': ['SUR', ],
-    }
-
     def add_data(self, market_data: dict[str:list]):
         """ Adds the received data to the storage, pre-filtering. """
 
@@ -74,16 +48,16 @@ class MyDataHandler(MicexISSDataHandler):
 
         for blockname in market_data:
             data[blockname] = data.get(blockname, []) + market_data[blockname]
-        self._container.data = self._filter_data(data, **self.FILTER_CRITERIES)
+        self._container.data = self._filter_data(data, **FILTER_CRITERIA)
 
     @staticmethod
     def _filter_data(data: dict[str:list], **criteries) -> dict[str:list]:
         """ Filters security data according to specified criteria. """
 
-        price_max: float = criteries.get('price_max', 101.0)    #: Максимальная цена, %
+        price_max: float = criteries.get('price_max', 101.0)  #: Максимальная цена, %
         duration_max: int = criteries.get('duration_max', 365)  #: Максимальная дюрация, дней
-        trades_min: int = criteries.get('trades_min', 300)      #: Минимальное количество заключенных сделок, шт
-        faceunits: list = criteries.get('faceunits', ['SUR'])   #: Валюта номинала
+        trades_min: int = criteries.get('trades_min', 300)  #: Минимальное количество заключенных сделок, шт
+        faceunits: list = criteries.get('faceunits', ['SUR'])  #: Валюта номинала
 
         def get_index_by_secid(secid: str, rows: list[dict]) -> int | None:
             for index, row in enumerate(rows):
@@ -137,7 +111,7 @@ class MyDataHandler(MicexISSDataHandler):
         return data
 
     def get_secids_list(self) -> list[str]:
-        """ Returns a list of SECID securities. """
+        """ Returns a security SECID. """
 
         data: dict[str:list] = self._container.data if self._container.data else {}
 
@@ -169,7 +143,7 @@ class MyDataHandler(MicexISSDataHandler):
 
     @staticmethod
     def _aggregate_data(array: list[dict], group_key: str, values_key: str) -> dict[str:list]:
-        data = {}
+        data: dict = {}
         for item in array:
             data[item[group_key]] = data.get(item.get(group_key), []) + [item.get(values_key)]
         return data
@@ -185,7 +159,7 @@ class MyDataHandler(MicexISSDataHandler):
         if coupons and securities:
             for secid in secids:
                 security: dict = list(filter(lambda row: bool(row.get('SECID') == secid), securities))[0]
-                coupons_count: int = len(list(filter(lambda row: bool(row.get('secid') == secid), coupons)))
+                coupons_count: int = len(list(filter(lambda row: bool(row.get('SECID') == secid), coupons)))
                 accruedint: Decimal = Decimal(security.get('ACCRUEDINT'))
                 couponvalue: Decimal = Decimal(security.get('COUPONVALUE'))
                 facevalue: Decimal = Decimal(security.get('FACEVALUE'))
@@ -207,46 +181,50 @@ class MyDataHandler(MicexISSDataHandler):
         self.add_data({'profit': [result]})
 
 
-def main():
+async def main():
     create_logger()
-    my_config = Config(user='username', password='password', proxy_url='')
-    my_auth = MicexAuth(my_config)
+    my_config = Config(user=USER, password=PASSWORD, proxy_url='')
+    async with MicexAuth(my_config) as my_auth:
+        await my_auth.auth()
 
-    if my_auth.is_real_time():
-        iss = MicexISSClient(config=my_config, auth=my_auth, handler=MyDataHandler, container=MyData)
+    async with MicexISSClient(config=my_config, auth=my_auth, handler=MyDataHandler, container=MyData) as iss:
+        await iss.get_available_bonds(
+            7, 58, 193, **{'iss.dp': 'comma',
+                           'iss.meta': 'off',
+                           'iss.only': 'securities,marketdata',
+                           'securities.columns': 'SECID,BOARDID,SECNAME,FACEUNIT,FACEVALUE,'
+                                                 'MATDATE,PREVLEGALCLOSEPRICE,ACCRUEDINT,COUPONVALUE',
+                           'marketdata.columns': 'SECID,DURATION',
+                           })
 
-        iss.get_available_bonds(7, 58, 193, **{'iss.dp': 'comma',
-                                               'iss.meta': 'off',
-                                               'iss.only': 'securities,marketdata',
-                                               'securities.columns': 'SECID,BOARDID,SECNAME,FACEUNIT,FACEVALUE,MATDATE,'
-                                                                     'PREVLEGALCLOSEPRICE,ACCRUEDINT,COUPONVALUE',
-                                               'marketdata.columns': 'SECID,DURATION',
-                                               })
         from_date: str = iss.handler.get_start_date()
         boards: dict = iss.handler.get_boards_with_secids()
 
-        for board, secids in boards.items():
-            iss.get_securities_history('stock',
-                                       'bonds',
-                                       board,
-                                       *secids,
-                                       **{'iss.only': 'history',
-                                          'history.columns': 'SECID,NUMTRADES',
-                                          'from': from_date},
-                                       )
+        async with asyncio.TaskGroup() as tg:   #: Группа задач получения истории по ценным бумагам
+            for board, secids in boards.items():
+                tg.create_task(iss.get_securities_history(
+                    'stock',
+                    'bonds',
+                    board,
+                    *secids,
+                    **{'iss.only': 'history',
+                       'history.columns': 'SECID,NUMTRADES',
+                       'from': from_date},
+                ))
 
         secids: list = iss.handler.get_secids_list()
-        iss.get_bonds_bondization(*secids, **{'iss.meta': 'off',
-                                              'iss.only': 'coupons',
-                                              'coupons.columns': 'coupondate,secid',
-                                              'lang': 'ru',
-                                              'from': datetime.now().strftime('%Y-%m-%d'),
-                                              'limit': 'unlimited',
-                                              })
+        await iss.get_bonds_bondization(
+            *secids, **{'iss.meta': 'off',
+                        'iss.only': 'coupons',
+                        'coupons.columns': 'coupondate,secid',
+                        'lang': 'ru',
+                        'from': datetime.now().strftime('%Y-%m-%d'),
+                        'limit': 'unlimited',
+                        })
 
         iss.handler.calculate_profit(*secids)
         iss.handler.container.print_data()
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())

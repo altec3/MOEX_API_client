@@ -1,12 +1,15 @@
+import asyncio
+from asyncio import Task
 import logging
-from typing import Type
 
-import requests
-from requests.cookies import RequestsCookieJar
+import aiohttp
+from aiohttp import ClientSession
+from http.cookies import SimpleCookie
+from typing import Type, Any
+
+from models import Blocks
 
 logger = logging.getLogger('basic')
-
-# TODO: Перейти на asyncio
 
 
 class Config(object):
@@ -20,44 +23,47 @@ class Config(object):
 
 
 class MicexAuth(object):
-    """ User authentication data and functions """
+    """ User authentication data and functions. """
 
     def __init__(self, config: Config):
         self._config: Config = config
-        self._cookie_jar: RequestsCookieJar | None = None
-        self._auth()
+        self._cookies: SimpleCookie | None = None
+        self._session = ClientSession()
 
-    def _auth(self):
+    async def __aenter__(self) -> 'MicexAuth':
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self._close()
+
+    async def auth(self, session: ClientSession = None):
         """ One attempt to authenticate """
 
-        response: requests.Response = requests.get(
-            url=self._config.auth_url,
-            auth=(self._config.user, self._config.password),
-            proxies=self._config.proxies if self._config.proxies else None
-        )
-        self._cookie_jar = response.cookies
+        session = self._session if session is None else session
+        async with session.get(
+                url=self._config.auth_url,
+                auth=aiohttp.BasicAuth(self._config.user, self._config.password),
+                proxy=self._config.proxies if self._config.proxies else None) as response:
+
+            self._cookies: SimpleCookie = response.cookies
 
         self._passport = None
-        for cookie in self._cookie_jar:
-            if cookie.name == 'MicexPassportCert':
-                self._passport = cookie
+        for value in self._cookies.values():
+            if value.key == 'MicexPassportCert':
+                self._passport = value
                 break
         if self._passport is None:
             print('Cookie not found!')
 
-    def is_real_time(self):
-        """ Repeat auth request if failed last time or cookie expired """
+    def is_authorized(self) -> bool:
+        return bool(self._passport)
 
-        if not self._passport or (self._passport and self._passport.is_expired()):
-            self._auth()
-        if self._passport and not self._passport.is_expired():
-            return True
-
-        return False
+    async def _close(self) -> None:
+        return await self._session.close()
 
     @property
-    def cookie_jar(self) -> RequestsCookieJar | None:
-        return self._cookie_jar
+    def cookies(self) -> SimpleCookie | None:
+        return self._cookies
 
 
 class MicexISSDataHandler(object):
@@ -90,76 +96,131 @@ class MicexISSClient(object):
     def __init__(self, config: Config, auth: MicexAuth, handler: Type[MicexISSDataHandler], container):
         """ Create connection with authorization cookie. """
 
-        self._session = requests.Session()
+        self._session = aiohttp.ClientSession()
         self._session.proxies = config.proxies
-        self._session.cookies = auth.cookie_jar
+        self._session.cookies = auth.cookies
         self._handler = handler(container)
 
-    def get_securities_history(self, engine: str, market: str, board: str, *secids: str, **params) -> bool:
-        """ Get and parse historical data on all the securities at the given engine, market, board. """
+    async def __aenter__(self) -> 'MicexISSClient':
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self._close()
+
+    async def _close(self) -> None:
+        return await self._session.close()
+
+    @staticmethod
+    def _merge_data(target: dict, source: dict) -> None:
+        """ Merges data from two dictionaries. """
+
+        for blockname in source:
+            if isinstance(source[blockname], list):
+                target[blockname] = target.get(blockname, []) + source[blockname]
+
+            if isinstance(source[blockname], dict):
+                if data := source[blockname].get('data', []):
+                    if target.get(blockname):
+                        target[blockname]['data'] = target[blockname].get('data', []) + data
+                    else:
+                        target[blockname] = source[blockname]
+
+    async def get_available_bonds(self, *boardgroups: int, **params) -> bool:
+        """Gets a list of available bonds.
+
+        :param boardgroups: Number indicating trading mode.
+                            See: https://iss.moex.com/iss/engines/stock/markets/bonds/boardgroups
+        :param params: Additional parameters that need to be added to the URL's query string.
+        :return: True for success, False otherwise.
+        """
+
+        boardgroups = (58,) if not boardgroups else boardgroups
+        params['limit'] = 'unlimited'
 
         data = {}
+
+        async with asyncio.TaskGroup() as tg:
+            tasks: list[Task] = [tg.create_task(
+                self._get_data(self.BASE_URL.format(method=self.METHODS['bonds'].format(boardgroup=str(boardgroup))),
+                               **params
+                               )) for boardgroup in boardgroups]
+
+        for task in tasks:
+            self._merge_data(data, task.result())
+
+        self._handler.add_data(data)
+        return True
+
+    async def get_securities_history(self, engine: str, market: str, board: str, *secids: str, **params) -> bool:
+        """Get and parse historical data on all the securities at the given engine, market, board.
+
+        :param engine: Engine. See: https://iss.moex.com/iss/engines/
+        :param market: Market. See: https://iss.moex.com/iss/engines/stock/markets/
+        :param board: Trading mode identifier. See: https://iss.moex.com/iss/engines/stock/markets/bonds/boards
+        :param secids: Financial instrument identifier.
+        :param params: Additional parameters that need to be added to the URL's query string.
+        :return: True for success, False otherwise.
+        """
+
+        data: dict = {}
+
         if secids:
-            for secid in secids:
-                url = self.BASE_URL.format(method=self.METHODS['sec_history'].format(engine=engine,
-                                                                                     market=market,
-                                                                                     board=board,
-                                                                                     security=secid,
-                                                                                     ))
-                secid_data: dict[str:list] = self._get_data(url, **params)
-                for blockname in secid_data:
-                    data[blockname] = data.get(blockname, []) + secid_data[blockname]
+            async with asyncio.TaskGroup() as tg:
+                tasks: list[Task] = [tg.create_task(
+                    self._get_data(self.BASE_URL.format(method=self.METHODS['sec_history'].format(engine=engine,
+                                                                                                  market=market,
+                                                                                                  board=board,
+                                                                                                  security=secid,
+                                                                                                  )),
+                                   **params
+                                   )) for secid in secids]
+
+            for task in tasks:
+                self._merge_data(data, task.result())
         else:
             logger.debug(f'[get_securities_history]. Отсутствуют SECID')
 
         self._handler.add_data(data)
         return True
 
-    def get_bonds_bondization(self, *secids: str, **params) -> bool:
-        """ Получает данные по облигациям. """
+    async def get_bonds_bondization(self, *secids: str, **params) -> bool:
+        """Retrieves detailed data on bonds.
 
-        data = {}
+        :param secids: Financial instrument identifier.
+        :param params: Additional parameters that need to be added to the URL's query string.
+        :return: True for success, False otherwise.
+        """
+
+        data: dict = {}
+
         if secids:
-            for secid in secids:
-                url: str = self.BASE_URL.format(method=self.METHODS['sec_bondization'].format(secid=secid))
-                secid_data: dict[str:list] = self._get_data(url, **params)
-                for blockname in secid_data:
-                    data[blockname] = data.get(blockname, []) + secid_data[blockname]
+            async with asyncio.TaskGroup() as tg:
+                tasks: list[Task] = [tg.create_task(
+                    self._get_data(self.BASE_URL.format(method=self.METHODS['sec_bondization'].format(secid=secid)),
+                                   **params
+                                   )) for secid in secids]
+
+            for task in tasks:
+                self._merge_data(data, task.result())
         else:
             logger.debug(f'[get_bonds_bondization]. Отсутствуют SECID')
 
         self._handler.add_data(data)
         return True
 
-    def get_available_bonds(self, *boardgroups: int, **params) -> bool:
-        """ Получает список доступных облигаций. """
+    async def _get_data(self, url: str, **params) -> dict[str:list]:
 
-        boardgroups = (58,) if not boardgroups else boardgroups
-        params['limit'] = 'unlimited'
+        def flatten_response(blocks: dict, blockname: str) -> list[dict]:
+            """ Converts data received from the API into a form suitable for transmission to pandas. """
 
-        data = {}
-        for boardgroup in boardgroups:
-            url: str = self.BASE_URL.format(method=self.METHODS['bonds'].format(boardgroup=str(boardgroup)))
-            boardgroup_data: dict[str:list] = self._get_data(url, **params)
-            for blockname in boardgroup_data:
-                data[blockname] = data.get(blockname, []) + boardgroup_data[blockname]
-
-        self._handler.add_data(data)
-        return True
-
-    def _get_data(self, url: str, **params) -> dict[str:list]:
-
-        def flatten(iss_data: dict, blockname: str) -> list[dict]:
-            """ Преобразует данные, полученные от API, в вид пригодный для передачи в pandas"""
-
-            columns: list | None = iss_data[blockname].get('columns', None)
-            data: list | None = iss_data[blockname].get('data', None)
+            columns: list | None = blocks[blockname].get('columns', None)
+            data: list | None = blocks[blockname].get('data', None)
 
             if columns and data:
                 security_data = []
 
-                for item in iss_data[blockname]['data']:
-                    item_data = {column: item[index] for index, column in enumerate(iss_data[blockname]['columns'])}
+                for item in blocks[blockname]['data']:
+                    item_data = {column: item[index] for index, column in enumerate(blocks[blockname]['columns'])}
                     security_data.append(item_data)
 
                 return security_data
@@ -170,39 +231,35 @@ class MicexISSClient(object):
         data: dict[str:list] = {}
 
         if limit == 'unlimited':
-            response: dict = self._send_request(url, **params)
+            response: dict[str:Any] = await self._send_request(url, **params)
             for blockname in response.keys():
-                block_data: list[dict] = flatten(response, blockname)
+                block_data: list[dict] = flatten_response(response, blockname)
                 data[blockname] = block_data
         else:
             start: int = 0
             count: int = 1
+
             while count > 0:
                 params['start'] = str(start)
 
-                response: dict = self._send_request(url, **params)
+                response: dict[str:Any] = await self._send_request(url, **params)
                 for blockname in response.keys():
-                    block_data: list[dict] = flatten(response, blockname)
+                    block_data: list[dict] = flatten_response(response, blockname)
                     data[blockname] = data.get(blockname, []) + block_data
-                    count: int = len(block_data)
 
+                    count: int = len(block_data)
                 start += count
 
         return data
 
-    def _send_request(self, url: str, **params) -> dict:
-        """ Отправляет запрос к API. """
-
-        response: requests.Response = self._session.get(url=url,
-                                                        params={**params},
-                                                        timeout=5,
-                                                        )
-        logger.debug(f'{response.url}')
+    async def _send_request(self, url: str, **params) -> dict[str:Any]:
+        """ Sends a request to the API. """
 
         try:
-            response: dict = response.json()
-            return response
-        except requests.JSONDecodeError:
+            async with self._session.get(url=url, params={**params}) as response:
+                logger.debug(f'{response.url}')
+                return Blocks(**await response.json(encoding='utf-8')).model_dump(exclude_none=True)
+        except aiohttp.ContentTypeError:
             return {}
 
     @property
