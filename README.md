@@ -25,7 +25,9 @@ Pydantic:2.3.0*
 1. В папке [config](config) разместить файл config.py с настройками клиента (см. файл **[config_example.py](config/config_example.py)**)
 2. Установить зависимости:
 ```python
-pip install -r requirements.txt
+pip install poetry
+poetry install
+poetry shell
 ```
 3. Запустить скрипт:
 

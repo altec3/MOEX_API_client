@@ -5,7 +5,7 @@ def create_logger():
     """ Создает базовый логгер """
 
     logger = logging.getLogger('basic')
-    logger.setLevel('DEBUG')
+    logger.setLevel('INFO')
     # file_handler = logging.FileHandler('./../project/logs/gui.log', mode='w',  encoding='utf-8')
     stream_handler = logging.StreamHandler()
     logger.addHandler(stream_handler)
