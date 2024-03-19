@@ -27,10 +27,13 @@ Pydantic:2.3.0*
 ```python
 pip install poetry
 poetry install
-poetry shell
 ```
 3. Запустить скрипт:
-
 ```python
-python main.py
+poetry run python main.py
+```
+
+Активация виртуального окружения (при необходимости):
+```shell
+poetry shell
 ```
